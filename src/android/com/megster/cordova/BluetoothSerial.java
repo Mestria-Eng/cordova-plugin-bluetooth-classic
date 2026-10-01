@@ -405,21 +405,70 @@ public class BluetoothSerial extends CordovaPlugin {
         return json;
     }
 
-    private void connect(CordovaArgs args, boolean secure, CallbackContext callbackContext) throws JSONException {
+    private void connect(CordovaArgs args, final boolean secure, final CallbackContext callbackContext) throws JSONException {
         String macAddress = args.getString(0);
-        BluetoothDevice device = bluetoothAdapter.getRemoteDevice(macAddress);
+        final BluetoothDevice device = bluetoothAdapter.getRemoteDevice(macAddress);
 
-        if (device != null) {
-            connectCallback = callbackContext;
-            bluetoothSerialService.connect(device, secure);
-            buffer.setLength(0);
-
-            PluginResult result = new PluginResult(PluginResult.Status.NO_RESULT);
-            result.setKeepCallback(true);
-            callbackContext.sendPluginResult(result);
-
-        } else {
+        if (device == null) {
             callbackContext.error("Could not connect to " + macAddress);
+            return;
+        }
+
+        connectCallback = callbackContext;
+
+        PluginResult result = new PluginResult(PluginResult.Status.NO_RESULT);
+        result.setKeepCallback(true);
+        callbackContext.sendPluginResult(result);
+
+        bondThenRun(device, new Runnable() {
+            @Override
+            public void run() {
+                buffer.setLength(0);
+                bluetoothSerialService.connect(device, secure);
+            }
+        });
+    }
+
+    /**
+     * Garante que o dispositivo esteja pareado antes de executar a conexão.
+     * Se já estiver, executa na hora; senão inicia o pareamento e só executa
+     * quando o Android confirmar BOND_BONDED.
+     */
+    private void bondThenRun(final BluetoothDevice device, final Runnable onBonded) {
+        if (device.getBondState() == BluetoothDevice.BOND_BONDED) {
+            onBonded.run();
+            return;
+        }
+
+        bluetoothAdapter.cancelDiscovery();
+
+        final Activity activity = cordova.getActivity();
+
+        final BroadcastReceiver bondReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                BluetoothDevice changed = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                if (changed == null || !changed.getAddress().equals(device.getAddress())) return;
+
+                int state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR);
+                int previous = intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, BluetoothDevice.ERROR);
+
+                if (state == BluetoothDevice.BOND_BONDED) {
+                    activity.unregisterReceiver(this);
+                    onBonded.run();
+                } else if (state == BluetoothDevice.BOND_NONE && previous == BluetoothDevice.BOND_BONDING) {
+                    activity.unregisterReceiver(this);
+                    notifyConnectionLost("Pairing failed or was cancelled.");
+                }
+            }
+        };
+
+        activity.registerReceiver(bondReceiver, new IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED));
+
+        // Se já está em BONDING, só aguarda; senão inicia o pareamento
+        if (device.getBondState() != BluetoothDevice.BOND_BONDING && !device.createBond()) {
+            activity.unregisterReceiver(bondReceiver);
+            notifyConnectionLost("Could not start pairing.");
         }
     }
 
